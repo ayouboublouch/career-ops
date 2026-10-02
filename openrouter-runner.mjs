@@ -36,6 +36,12 @@ import { appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { localToday } from './lib/local-today.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+try {
+  const { config } = await import('dotenv');
+  config();
+} catch { /* dotenv is optional when credentials are already in the environment */ }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const tracker = new TokenAccumulator();
@@ -67,7 +73,7 @@ const OPENROUTER_API_URL    = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
 const MAX_TOKENS            = 8192;
 const RATE_LIMIT_DELAY_MS   = 2500;  // pause between requests on free tier
-const MODEL_TIMEOUT_MS      = 15_000; // abort a single model call after 15 s
+const MODEL_TIMEOUT_MS      = 60_000; // allow free providers time to produce a full structured report
 
 // Provider priority order — models are sorted by provider prefix, not hardcoded names.
 // Add, remove, or reorder providers here; model names are resolved at runtime from the API.
@@ -223,6 +229,32 @@ export function buildCachedSystemMessage(systemPrompt) {
 // OpenRouter API call — automatic model rotation with fallback
 // ---------------------------------------------------------------------------
 async function callOpenRouter(systemPrompt, userMessage) {
+  if (process.env.CAREER_OPS_PROVIDER?.toLowerCase() === 'gemini') {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) throw new Error('GEMINI_API_KEY not found. Set it in .env or the environment.');
+    const modelName = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+    activeModel = modelName;
+    process.stdout.write(`[model] ${modelName} (direct Gemini) ... `);
+    const genAI = new GoogleGenerativeAI(key);
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      systemInstruction: systemPrompt,
+      generationConfig: { temperature: 0.4, maxOutputTokens: MAX_TOKENS },
+    });
+    const result = await model.generateContent(userMessage);
+    const content = result.response.text();
+    if (!content) throw new Error('Empty Gemini response');
+    console.log('OK');
+    return {
+      content,
+      usage: {
+        prompt_tokens: result.response.usageMetadata?.promptTokenCount ?? 0,
+        completion_tokens: result.response.usageMetadata?.candidatesTokenCount ?? 0,
+        total_tokens: result.response.usageMetadata?.totalTokenCount ?? 0,
+        cached_tokens: result.response.usageMetadata?.cachedContentTokenCount ?? 0,
+      },
+    };
+  }
   const key = process.env.OPENROUTER_API_KEY;
   if (!key) {
     throw new Error(
@@ -399,7 +431,37 @@ export function buildSystemPrompt(modeContent, ctx) {
     '---',
     'OUTPUT LANGUAGE:',
     languageInstruction,
+    '---',
+    'REPORT OUTPUT CONTRACT (mandatory):',
+    'Return only the completed Markdown evaluation report. Do not emit tool calls, XML, JSON, planning text, safety-only text, or a narration of actions.',
+    'The report MUST begin with these exact header fields, using a numeric score from 1.0 to 5.0:',
+    '**Score:** X.X/5',
+    '**Legitimacy:** {tier}',
+    'Then include a fenced YAML block headed exactly `## Machine Summary` with at least: company, role, score, legitimacy_tier, archetype, final_decision, hard_stops, soft_gaps, top_strengths, risk_level, confidence, next_action, work_auth.',
+    'Then include exactly these report sections: `## A. Role Summary`, `## B. Fit Analysis`, `## C. Level and Strategy`, `## D. Compensation and Demand`, `## E. Personalization`, `## F. Interview Prep (STAR+R)`, and `## G. Posting Legitimacy`. Include the Work-Auth signal in section A and Machine Summary.',
+    'Never claim a report was saved; the runner saves it after validating this contract.',
   ].filter(Boolean).join('\n\n');
+}
+
+const REQUIRED_REPORT_SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+
+export function validateEvaluationReport(content) {
+  if (typeof content !== 'string' || content.trim().length < 800) {
+    return { valid: false, reason: 'response is empty or too short' };
+  }
+  if (!/^\s*\*\*Score:\*\*\s*[1-5](?:\.\d)?\/5\s*$/mi.test(content)) {
+    return { valid: false, reason: 'missing numeric **Score:** X.X/5 header' };
+  }
+  if (!/^\s*## Machine Summary\s*$/mi.test(content)) {
+    return { valid: false, reason: 'missing ## Machine Summary' };
+  }
+  const missing = REQUIRED_REPORT_SECTIONS.filter(section =>
+    !new RegExp(`^#{1,3}\\s*(?:${section}[).:-]?|Block\\s+${section}\\b)`, 'mi').test(content)
+  );
+  if (missing.length > 0) {
+    return { valid: false, reason: `missing sections: ${missing.join(', ')}` };
+  }
+  return { valid: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +755,27 @@ async function cmdEvaluate(input, ctx) {
     return null;
   }
   tracker.record('evaluation', resultObj.usage);
-  const result = resultObj.content;
+  let result = resultObj.content;
+  let validation = validateEvaluationReport(result);
+  for (let repairAttempt = 1; !validation.valid && repairAttempt <= 2; repairAttempt++) {
+    console.warn(`\n[report] Invalid model output (${validation.reason}); requesting structured retry ${repairAttempt}/2...`);
+    try {
+      const repaired = await callOpenRouter(
+        systemPrompt,
+        `The previous response failed validation: ${validation.reason}. Rewrite the evaluation from scratch as a complete report that follows the mandatory REPORT OUTPUT CONTRACT exactly. Return only the Markdown report.\n\nJOB LISTING:\n${jdText}`,
+      );
+      tracker.record('evaluation', repaired.usage);
+      result = repaired.content;
+      validation = validateEvaluationReport(result);
+    } catch (e) {
+      console.error(`[report] Structured retry failed: ${e.message}`);
+      break;
+    }
+  }
+  if (!validation.valid) {
+    console.error(`[report] Refusing to save malformed evaluation: ${validation.reason}`);
+    return null;
+  }
 
   let reservedNumbers;
   try {
